@@ -37,6 +37,7 @@ from synthesis.validation_matrix import ValidationMatrix, PredictionEvent
 from synthesis.temporal_aligner import TemporalAligner
 from synthesis.arbiter import Arbiter
 from synthesis.archon import Archon
+from query_engine import build_query_context
 
 
 class FatesOrchestrator:
@@ -63,9 +64,14 @@ class FatesOrchestrator:
                        location: str,
                        gender: str = "unspecified",
                        name: str = "Unknown",
-                       output_dir: str = "./reports") -> str:
+                       output_dir: str = "./reports",
+                       user_questions: list = None) -> str:
         """
         Generate complete master report with V2 predictive engines.
+        user_questions: list of up to 5 question strings (optional).
+          When provided, QueryEngine extracts themes and steers every section
+          of the report toward what the user asked about, then adds a direct
+          Q&A section (Part IV) with verdicts at the end.
         """
         print("🔮 Fates Engine v2.0: Initializing Mathematical Core...")
         print(f"   Subject: {name}")
@@ -107,22 +113,24 @@ class FatesOrchestrator:
         )
         print(f"   ✓ Identified {len(clusters)} temporal 'storm windows'")
 
-        # 3. Expert analysis (with validation data)
+        # 3. Expert analysis (with validation data + question focus)
         print("\n🎭 Layer 3: Expert Swarm Analysis...")
-        analyses = self._gather_expert_analyses(chart_data, convergences, contradictions)
+        analyses = self._gather_expert_analyses(chart_data, convergences, contradictions,
+                                                user_questions=user_questions)
         print(f"   ✓ Western Expert ({analyses[0].get('model_used')})")
         print(f"   ✓ Vedic Expert ({analyses[1].get('model_used')})")
         print(f"   ✓ Saju Expert ({analyses[2].get('model_used')})")
         print(f"   ✓ Hellenistic Expert ({analyses[3].get('model_used')})")
 
-        # 4. Arbiter synthesis with pre-validated data
+        # 4. Arbiter synthesis with pre-validated data + question focus
         print("\n🌐 Layer 4: Cross-System Synthesis...")
         synthesis = self.arbiter.reconcile(
             analyses,
             chart_data,
             convergences=convergences,
             contradictions=contradictions,
-            temporal_clusters=clusters
+            temporal_clusters=clusters,
+            user_questions=user_questions,
         )
 
         consensus_count = len(synthesis.get('consensus_points', []))
@@ -139,11 +147,23 @@ class FatesOrchestrator:
             "birth_year": chart_data.get("meta", {}).get("birth_year"),
         }
 
+        # Build query context — steers every section toward user's questions
+        query_context = None
+        if user_questions:
+            clean_qs = [q.strip() for q in user_questions if q and q.strip()][:5]
+            if clean_qs:
+                query_context = build_query_context(clean_qs)
+                themes = query_context.get("themes", [])
+                print(f"   ✓ Query context built — {len(clean_qs)} questions, "
+                      f"themes: {', '.join(themes) if themes else 'general'}")
+
         report = self.archon.generate_report(
                    synthesis,
                    chart_data,
                    metadata,
-                   temporal_clusters=clusters)    # ← NEW: exact date windows for predictive chapters)
+                   temporal_clusters=clusters,
+                   user_questions=user_questions,
+                   query_context=query_context)
 
         # 6. Save with timestamp
         os.makedirs(output_dir, exist_ok=True)
@@ -511,20 +531,35 @@ class FatesOrchestrator:
                 except Exception as e:
                     logger.warning(f"Error processing Da Yun: {e}")
 
-        # Profections (0.70)
+        # Profections (0.70) — use birthday-relative date, not Jan 1
         profs = w_pred.get("profections_timeline", [])
+        birth_year = chart_data.get("meta", {}).get("birth_year", now.year)
+        birth_jd   = chart_data.get("meta", {}).get("jd", 0)
+        # Approximate birth month/day from JD
+        try:
+            import swisseph as swe
+            _y, _m, _d, _h = swe.revjul(birth_jd)
+            birth_month, birth_day = int(_m), int(_d)
+        except Exception:
+            birth_month, birth_day = 7, 1  # safe fallback
+
         for prof in profs[:5]:
             if isinstance(prof, dict):
                 try:
                     year = prof.get("year", now.year)
-                    start_date = datetime(year, 1, 1)
+                    age  = prof.get("age", 0)
+                    # Profection activates on the birthday in that year
+                    try:
+                        start_date = datetime(year, birth_month, birth_day)
+                    except ValueError:
+                        start_date = datetime(year, birth_month, 28)
                     events.append(PredictionEvent(
                         system="Western",
                         technique="Profection",
                         date_range=(start_date, start_date + timedelta(days=365)),
                         theme=f"Profected {prof.get('profected_sign', 'Unknown')}",
                         confidence=WEIGHTS.get("Profection", 0.70),
-                        description=f"Annual Profection: {prof.get('time_lord', '?')} rules year {year}",
+                        description=f"Annual Profection age {age}: {prof.get('time_lord', '?')} rules year {year}",
                         house_involved=prof.get("activated_house", 1),
                         planets_involved=[prof.get("time_lord", "Sun")]
                     ))
@@ -533,6 +568,59 @@ class FatesOrchestrator:
 
         chart_data["predictive_event_count"] = len(events)
 
+        # Outer Planet Transit Exact Hits (0.62 weight — individual aspect dates)
+        # These are the most precise timing data in the chart: exact dates from ephemeris.
+        outer = w_pred.get("outer_transit_aspects", {})
+        for hit in outer.get("hits") or outer.get("all_hits", []):
+            try:
+                # Prefer ISO format; fall back to parsing "Mon DD, YYYY"
+                iso_date = hit.get("exact_date_iso", "")
+                if iso_date:
+                    y, mo, d = map(int, iso_date.split("-"))
+                    exact_dt = datetime(y, mo, d)
+                else:
+                    from datetime import datetime as _dt
+                    exact_dt = _dt.strptime(hit.get("exact_date", ""), "%b %d, %Y")
+
+                if exact_dt <= now:
+                    continue   # past — skip
+
+                # Entry/exit window from the hit dict (already ISO if present)
+                entry_str = hit.get("entry_date", "")
+                exit_str  = hit.get("exit_date", "")
+                try:
+                    entry_dt = datetime.strptime(entry_str, "%Y-%m-%d") if entry_str else exact_dt - timedelta(days=45)
+                    exit_dt  = datetime.strptime(exit_str,  "%Y-%m-%d") if exit_str  else exact_dt + timedelta(days=45)
+                except Exception:
+                    entry_dt = exact_dt - timedelta(days=45)
+                    exit_dt  = exact_dt + timedelta(days=45)
+
+                transiting = hit.get("transiting") or hit.get("planet", "Unknown")
+                natal_pt   = hit.get("natal_point", "Unknown")
+                aspect     = hit.get("aspect", "?")
+
+                house_map = {
+                    "Sun": 5, "Moon": 4, "Mercury": 3, "Venus": 7,
+                    "Mars": 1, "Ascendant": 1, "Midheaven": 10
+                }
+                house = house_map.get(natal_pt, 1)
+
+                events.append(PredictionEvent(
+                    system="Western",
+                    technique="Transit_Aspect",
+                    date_range=(entry_dt, exit_dt),
+                    theme=f"{transiting} {aspect} {natal_pt}",
+                    confidence=WEIGHTS.get("Transit_Aspect", 0.62),
+                    description=(
+                        f"{transiting} {aspect} natal {natal_pt} "
+                        f"exact {exact_dt.strftime('%Y-%m-%d')} (orb {hit.get('orb_at_exact','?')}°)"
+                    ),
+                    house_involved=house,
+                    planets_involved=[transiting, natal_pt]
+                ))
+            except Exception as e:
+                logger.warning(f"Error processing transit hit: {e}")
+
         if not events:
             logger.warning("No predictive events extracted - check chart data structure")
 
@@ -540,19 +628,24 @@ class FatesOrchestrator:
         return events
 
     def _gather_expert_analyses(self, chart_data: Dict, convergences: List[Dict],
-                               contradictions: List[Dict]) -> list:
-        """Gather analyses with pre-validated context."""
+                               contradictions: List[Dict],
+                               user_questions: list = None) -> list:
+        """Gather analyses with pre-validated context and question focus."""
         print("   Analyzing with Western Expert (Primary Directions emphasis)...")
-        western = self.western_expert.analyze(chart_data, "natal")
+        western = self.western_expert.analyze(chart_data, "natal",
+                                              user_questions=user_questions)
 
         print("   Analyzing with Vedic Expert (Ashtakavarga + Vargas)...")
-        vedic = self.vedic_expert.analyze(chart_data, "natal")
+        vedic = self.vedic_expert.analyze(chart_data, "natal",
+                                          user_questions=user_questions)
 
         print("   Analyzing with Saju Expert...")
-        saju = self.saju_expert.analyze(chart_data, "natal")
+        saju = self.saju_expert.analyze(chart_data, "natal",
+                                        user_questions=user_questions)
 
         print("   Analyzing with Hellenistic Expert...")
-        hellenistic = self.hellenistic_expert.analyze(chart_data, "natal")
+        hellenistic = self.hellenistic_expert.analyze(chart_data, "natal",
+                                                      user_questions=user_questions)
 
         return [western, vedic, saju, hellenistic]
 

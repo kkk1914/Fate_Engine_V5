@@ -36,8 +36,8 @@ FORMAT — write 6 sections in this exact order:
 
 Length: 600-800 words total. Dense, specific, no padding."""
 
-    def analyze(self, chart_data: dict, mode: str = "natal") -> dict:
-        prompt = self._build_prompt(chart_data, mode)
+    def analyze(self, chart_data: dict, mode: str = "natal", user_questions: list = None) -> dict:
+        prompt = self._question_prefix(user_questions) + self._build_prompt(chart_data, mode)
 
         response = gateway.generate(
             system_prompt=self.SYSTEM_PROMPT,
@@ -53,6 +53,34 @@ Length: 600-800 words total. Dense, specific, no padding."""
             "confidence": 0.92 if response.get("success") else 0.0,
             "model_used": settings.vedic_expert_model
         }
+
+
+    @staticmethod
+    def _question_prefix(user_questions: list) -> str:
+        """Build a question-focus block to prepend to expert prompts."""
+        if not user_questions:
+            return ""
+        qs = [q.strip() for q in user_questions if q and q.strip()][:5]
+        if not qs:
+            return ""
+        lines = [
+            "╔══════════════════════════════════════════════════════════════╗",
+            "║  THESE QUESTIONS WERE SUBMITTED — BIAS YOUR ANALYSIS TOWARD ║",
+            "║  THE MECHANISMS MOST RELEVANT TO ANSWERING THEM.            ║",
+            "╚══════════════════════════════════════════════════════════════╝",
+        ]
+        for i, q in enumerate(qs, 1):
+            lines.append(f"  Q{i}: {q}")
+        lines += [
+            "",
+            "Prioritize the chart mechanisms, house lords, planets, and timing",
+            "windows most relevant to these questions. Do not answer them directly",
+            "— that is the Archon's job. But make sure the relevant evidence is",
+            "visible in your analysis so the synthesis layer can find it.",
+            "══════════════════════════════════════════════════════════════════",
+            "",
+        ]
+        return "\n".join(lines) + "\n\n"
 
     def _build_prompt(self, data: dict, mode: str) -> str:
         vedic = data.get("vedic", {})

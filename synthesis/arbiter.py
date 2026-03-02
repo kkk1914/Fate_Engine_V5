@@ -34,9 +34,11 @@ OUTPUT FORMAT: Strict JSON only."""
     def reconcile(self, analyses: List[Dict], chart_data: Dict,
                   convergences: List[Dict] = None,
                   contradictions: List[Dict] = None,
-                  temporal_clusters: List[Dict] = None) -> Dict[str, Any]:
+                  temporal_clusters: List[Dict] = None,
+                  user_questions: list = None) -> Dict[str, Any]:
         """Reconcile four expert analyses. Retries up to 3 times on connection errors."""
-        prompt = self._build_prompt(analyses, chart_data, convergences, contradictions, temporal_clusters)
+        prompt = self._build_prompt(analyses, chart_data, convergences, contradictions,
+                                    temporal_clusters, user_questions)
 
         schema = {
             "type": "object",
@@ -137,8 +139,21 @@ OUTPUT FORMAT: Strict JSON only."""
     def _build_prompt(self, analyses: List[Dict], chart_data: Dict,
                       convergences: List[Dict] = None,
                       contradictions: List[Dict] = None,
-                      temporal_clusters: List[Dict] = None) -> str:
+                      temporal_clusters: List[Dict] = None,
+                      user_questions: list = None) -> str:
         """Build specific prompt for reconciliation."""
+        # Question focus block — makes arbiter synthesis question-biased
+        q_block = ""
+        if user_questions:
+            clean_qs = [q.strip() for q in user_questions if q and q.strip()][:5]
+            if clean_qs:
+                q_block = (
+                    "\n=== USER QUESTIONS — BIAS SYNTHESIS TOWARD THESE DOMAINS ===\n"
+                    "The native submitted these questions. When writing consensus_points\n"
+                    "and critical_periods, prioritize mechanisms that answer them.\n"
+                    + "\n".join(f"  Q{i+1}: {q}" for i, q in enumerate(clean_qs))
+                    + "\n=== END QUESTIONS ===\n\n"
+                )
         # Unpack analyses with truncation to save tokens
         def truncate(text, max_len=1500):
             if not text or len(text) <= max_len:
@@ -161,7 +176,7 @@ OUTPUT FORMAT: Strict JSON only."""
         contrad_summary = f"{len(contradictions)} contradictions" if contradictions else "None"
         cluster_summary = f"{len(temporal_clusters)} temporal clusters" if temporal_clusters else "None"
 
-        return f"""SYNTHESIZE THESE FOUR EXPERT ANALYSES:
+        return q_block + f"""SYNTHESIZE THESE FOUR EXPERT ANALYSES:
 
 === WESTERN (Tropical) ===
 {truncate(western.get('analysis', 'No analysis'))}

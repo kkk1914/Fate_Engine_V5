@@ -27,8 +27,26 @@ ASPECTS = [(0, "Conjunction"), (60, "Sextile"), (90, "Square"),
            (120, "Trine"), (180, "Opposition")]
 OOB_LIMIT = 23.4392911
 
+# Outer planets to scan for transit aspects
+OUTER_PLANETS = {
+    "Jupiter": swe.JUPITER,
+    "Saturn":  swe.SATURN,
+    "Uranus":  swe.URANUS,
+    "Neptune": swe.NEPTUNE,
+    "Pluto":   swe.PLUTO,
+}
+
+# Natal points that matter for life events
+TRANSIT_TARGETS = ["Sun", "Moon", "Mercury", "Venus", "Mars",
+                   "Ascendant", "Midheaven"]
+
+# Orb for transit hits (degrees)
+TRANSIT_ORB = 1.0
+
+
 def clamp360(x: float) -> float:
     return x % 360.0
+
 
 def midpoint(d1: float, d2: float) -> float:
     a, b = clamp360(d1), clamp360(d2)
@@ -36,6 +54,19 @@ def midpoint(d1: float, d2: float) -> float:
     if diff > 180:
         return clamp360((a + b + 360) / 2)
     return clamp360((a + b) / 2)
+
+
+def _angular_distance(a: float, b: float) -> float:
+    """Smallest arc between two ecliptic longitudes."""
+    diff = abs(clamp360(a) - clamp360(b))
+    return min(diff, 360.0 - diff)
+
+
+def _aspect_orb(lon_transit: float, lon_natal: float, angle: float) -> float:
+    """Return orb of transit to aspect angle, or 999 if not within range."""
+    sep = _angular_distance(lon_transit, lon_natal)
+    return abs(sep - angle)
+
 
 class WesternEngine:
     """Tropical astrology with predictive techniques."""
@@ -47,7 +78,7 @@ class WesternEngine:
                   time_known: bool, birth_year: int) -> Dict[str, Any]:
         """Calculate complete Western chart."""
         natal = self._calc_natal(jd, lat, lon, time_known)
-        predictive = self._calc_predictive(jd, birth_year, natal, time_known)
+        predictive = self._calc_predictive(jd, birth_year, natal, time_known, lat, lon)
 
         # Primary Directions (5-year)
         pd_engine = PrimaryDirections(jd, lat, lon)
@@ -136,7 +167,7 @@ class WesternEngine:
             "latitude": 0.0,
             "declination": 0.0,
             "out_of_bounds": False,
-            "retrograde": True  # Nodes are always retrograde
+            "retrograde": True
         }
         placements["South Node"] = {
             "longitude": clamp360(node_pos[0] + 180),
@@ -221,14 +252,7 @@ class WesternEngine:
         return aspects
 
     def _calc_lots(self, asc: float, sun: float, moon: float) -> Dict[str, Any]:
-        """Calculate Arabic Parts (Lots of Fortune and Spirit).
-
-        Day chart: Sun is 0-180° ahead of Ascendant in zodiac order (above horizon).
-        This matches the Hellenistic engine formula exactly.
-        Day formula:   Fortune = Asc + Moon - Sun
-        Night formula: Fortune = Asc + Sun - Moon
-        Spirit is always the reverse of Fortune.
-        """
+        """Calculate Arabic Parts (Lots of Fortune and Spirit)."""
         diff = (sun - asc) % 360
         is_day = 0.0 < diff < 180.0
 
@@ -267,7 +291,7 @@ class WesternEngine:
                 diff = abs(clamp360(lon) - clamp360(s_lon))
                 dist = min(diff, 360 - diff)
 
-                if dist <= 1.0:  # 1 degree orb
+                if dist <= 1.0:
                     hits.append({
                         "planet": pname,
                         "star": star,
@@ -275,131 +299,395 @@ class WesternEngine:
                     })
         return hits
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # OUTER TRANSIT ASPECT SCANNER
+    # Replaces the Jan-1 snapshot with exact-date aspect hits.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _scan_outer_transit_aspects(
+        self,
+        natal: Dict,
+        scan_years: int = 5,
+        orb: float = TRANSIT_ORB,
+    ) -> Dict[str, Any]:
+        """
+        Scan day-by-day over `scan_years` to find every moment an outer planet
+        forms an exact aspect (±orb) to a natal point.
+
+        Returns:
+            {
+              "by_year":      {str(year): [hit, ...]},
+              "all_hits":     [hit, ...],       # sorted by exact_jd
+              "summary_block": str              # dense text for LLM context
+            }
+
+        Each hit dict:
+            planet, natal_point, aspect, orb_at_exact, exact_date,
+            exact_jd, year, applying (bool), natal_lon, transit_lon
+        """
+        now     = datetime.now(timezone.utc)
+        start_jd = ephe.julian_day(now)
+        end_jd   = start_jd + scan_years * 365.25
+
+        # Build natal point longitudes
+        natal_lons: Dict[str, float] = {}
+        for p in TRANSIT_TARGETS:
+            if p in natal.get("placements", {}):
+                natal_lons[p] = natal["placements"][p]["longitude"]
+            elif p in natal.get("angles", {}):
+                natal_lons[p] = natal["angles"][p]["longitude"]
+
+        if not natal_lons:
+            return {"by_year": {}, "all_hits": [], "summary_block": "No natal points found."}
+
+        all_hits: List[Dict] = []
+
+        # Step 3 days at a time (outer planets move <0.15°/day — safe for 1° orb)
+        # Then do binary refinement when a crossing is detected.
+        step_jd = 3.0
+
+        for t_name, t_code in OUTER_PLANETS.items():
+            for n_name, n_lon in natal_lons.items():
+                for ang, asp_name in ASPECTS:
+                    # Track sign of (current_orb - target) to detect zero crossings
+                    jd_scan = start_jd
+                    prev_orb: Optional[float] = None
+                    prev_jd:  Optional[float] = None
+
+                    while jd_scan <= end_jd:
+                        t_lon, _ = ephe.planet_longitude(jd_scan, t_code)
+                        cur_orb = _aspect_orb(t_lon, n_lon, ang)
+
+                        if prev_orb is not None and prev_orb > orb and cur_orb <= orb:
+                            # Entered orb — refine exact with binary search
+                            exact_jd = self._refine_exact(
+                                t_code, n_lon, ang, prev_jd, jd_scan
+                            )
+                            if exact_jd is not None:
+                                t_lon_exact, _ = ephe.planet_longitude(exact_jd, t_code)
+                                final_orb = _aspect_orb(t_lon_exact, n_lon, ang)
+
+                                # Determine applying vs separating
+                                t_lon_plus1, _ = ephe.planet_longitude(exact_jd + 1, t_code)
+                                orb_plus1 = _aspect_orb(t_lon_plus1, n_lon, ang)
+                                applying = orb_plus1 < final_orb
+
+                                dt_exact = datetime(*swe.revjul(exact_jd)[:3])
+                                exact_date_str    = dt_exact.strftime("%b %d, %Y")
+                                exact_date_iso    = dt_exact.strftime("%Y-%m-%d")   # ISO for parsers
+                                year = dt_exact.year
+
+                                # Approximate entry/exit window (±ORB days at outer planet speed)
+                                # Outer planets move ~0.03–0.25°/day; 3° orb ≈ 12–100 days either side.
+                                # Use a simple ±45-day estimate as a safe conservative window.
+                                dt_entry = datetime(*swe.revjul(exact_jd - 45)[:3])
+                                dt_exit  = datetime(*swe.revjul(exact_jd + 45)[:3])
+
+                                hit = {
+                                    # Canonical names
+                                    "planet":        t_name,
+                                    "natal_point":   n_name,
+                                    "aspect":        asp_name,
+                                    "orb_at_exact":  round(final_orb, 3),
+                                    "exact_date":    exact_date_str,     # human: "Mar 14, 2027"
+                                    "exact_date_iso": exact_date_iso,    # machine: "2027-03-14"
+                                    "exact_jd":      round(exact_jd, 4),
+                                    "year":          year,
+                                    "applying":      applying,
+                                    "natal_lon":     round(n_lon, 4),
+                                    "transit_lon":   round(t_lon_exact, 4),
+                                    # Aliases for downstream consumers
+                                    "transiting":    t_name,             # alias for "planet"
+                                    "entry_date":    dt_entry.strftime("%Y-%m-%d"),
+                                    "exit_date":     dt_exit.strftime("%Y-%m-%d"),
+                                }
+                                all_hits.append(hit)
+
+                        elif prev_orb is not None and prev_orb <= orb and cur_orb > orb:
+                            # Exiting orb — capture separating exact if we missed ingress
+                            pass  # already captured on entry
+
+                        prev_orb = cur_orb
+                        prev_jd  = jd_scan
+                        jd_scan += step_jd
+
+        # Sort by date
+        all_hits.sort(key=lambda h: h["exact_jd"])
+
+        # Group by year
+        by_year: Dict[str, List] = {}
+        for hit in all_hits:
+            yr = str(hit["year"])
+            by_year.setdefault(yr, []).append(hit)
+
+        # Build dense summary block for LLM
+        summary_lines = ["=== OUTER PLANET TRANSIT ASPECTS (exact dates) ==="]
+        for hit in all_hits[:60]:  # cap to avoid context bloat
+            app = "applying" if hit["applying"] else "separating"
+            summary_lines.append(
+                f"{hit['exact_date']}: {hit['planet']} {hit['aspect']} "
+                f"natal {hit['natal_point']} (orb {hit['orb_at_exact']:.2f}°, {app})"
+            )
+        summary_block = "\n".join(summary_lines)
+
+        return {
+            "by_year":       by_year,
+            "all_hits":      all_hits,
+            "hits":          all_hits,   # alias — some consumers read "hits", others "all_hits"
+            "summary_block": summary_block,
+        }
+
+    def _refine_exact(
+        self,
+        planet_code: int,
+        natal_lon: float,
+        aspect_angle: float,
+        jd_lo: float,
+        jd_hi: float,
+        max_iter: int = 20,
+    ) -> Optional[float]:
+        """
+        Binary search between jd_lo and jd_hi for the JD where
+        _aspect_orb(transit, natal, angle) is minimised (closest to exact).
+        Returns JD of minimum orb, or None if something goes wrong.
+        """
+        try:
+            for _ in range(max_iter):
+                mid = (jd_lo + jd_hi) / 2.0
+                t_lon_lo, _ = ephe.planet_longitude(jd_lo, planet_code)
+                t_lon_hi, _ = ephe.planet_longitude(jd_hi, planet_code)
+                t_lon_mid, _ = ephe.planet_longitude(mid, planet_code)
+
+                orb_lo  = _aspect_orb(t_lon_lo,  natal_lon, aspect_angle)
+                orb_mid = _aspect_orb(t_lon_mid, natal_lon, aspect_angle)
+                orb_hi  = _aspect_orb(t_lon_hi,  natal_lon, aspect_angle)
+
+                if orb_mid <= orb_lo and orb_mid <= orb_hi:
+                    return mid
+                elif orb_lo < orb_hi:
+                    jd_hi = mid
+                else:
+                    jd_lo = mid
+
+                if (jd_hi - jd_lo) < (1.0 / 1440):  # converged to < 1 minute
+                    break
+
+            return (jd_lo + jd_hi) / 2.0
+        except Exception:
+            return None
+
     def _calc_predictive(self, jd: float, birth_year: int,
-                         natal: Dict, time_known: bool) -> Dict[str, Any]:
+                         natal: Dict, time_known: bool,
+                         birth_lat: float = 0.0, birth_lon: float = 0.0) -> Dict[str, Any]:
         """Calculate predictive elements (5-year timeline)."""
         now = datetime.now(timezone.utc)
         current_age = max(0, now.year - birth_year)
 
-        # ── Secondary Progressions ────────────────────────────────────────────
-        prog_jd = jd + current_age  # 1 day = 1 year
-        progressions = {}
+        # ── SECONDARY PROGRESSIONS — Full Implementation ─────────────────────
+        # Accurate elapsed time: use JD arithmetic, not calendar year integer.
+        # 1 day of ephemeris = 1 year of life (Ptolemy's "day-for-a-year" rule).
+        now_jd      = ephe.julian_day(now)
+        elapsed_yrs = (now_jd - jd) / 365.25   # precise fractional years
+        prog_jd     = jd + elapsed_yrs          # progressed moment in ephemeris
 
-        for name, code in [("Sun", swe.SUN), ("Moon", swe.MOON)]:
-            lon, _ = ephe.planet_longitude(prog_jd, code)
+        progressions: Dict[str, Any] = {}
+
+        # All 7 classical planets (outer planets progress imperceptibly fast
+        # but Jupiter/Saturn still move ~5°/~2° per year — worth including)
+        PROG_PLANETS = [
+            ("Sun",     swe.SUN),     ("Moon",    swe.MOON),
+            ("Mercury", swe.MERCURY), ("Venus",   swe.VENUS),
+            ("Mars",    swe.MARS),    ("Jupiter", swe.JUPITER),
+            ("Saturn",  swe.SATURN),
+        ]
+
+        for name, code in PROG_PLANETS:
+            p_lon, _ = ephe.planet_longitude(prog_jd, code)
             progressions[f"Progressed_{name}"] = {
-                "longitude": lon,
-                "sign": ZODIAC[int(clamp360(lon) // 30)],
-                "degree": clamp360(lon) % 30
+                "longitude":  p_lon,
+                "sign":       ZODIAC[int(clamp360(p_lon) // 30)],
+                "degree":     round(clamp360(p_lon) % 30, 4),
+                "retrograde": ephe.is_retrograde(prog_jd, code),
             }
 
-        # ── Solar Arc ─────────────────────────────────────────────────────────
+        # Progressed Ascendant and Midheaven
+        # Cast the full house chart at prog_jd using natal geographic coordinates.
+        # This is the correct modern method (not Solar Arc MC approximation).
+        if time_known and birth_lat and birth_lon:
+            try:
+                prog_cusps, prog_ascmc = ephe.houses(prog_jd, birth_lat, birth_lon, b'P')
+                p_asc = float(prog_ascmc[0])
+                p_mc  = float(prog_ascmc[1])
+                progressions["Progressed_Ascendant"] = {
+                    "longitude": p_asc,
+                    "sign":      ZODIAC[int(clamp360(p_asc) // 30)],
+                    "degree":    round(clamp360(p_asc) % 30, 4),
+                }
+                progressions["Progressed_MC"] = {
+                    "longitude": p_mc,
+                    "sign":      ZODIAC[int(clamp360(p_mc) // 30)],
+                    "degree":    round(clamp360(p_mc) % 30, 4),
+                }
+            except Exception:
+                pass  # Skip quietly if coordinates unavailable
+
+        # Progressed lunar phase (secondary progression Moon-Sun relationship)
+        # Tells the broad developmental chapter the native is in
+        if "Progressed_Sun" in progressions and "Progressed_Moon" in progressions:
+            p_sun_lon  = progressions["Progressed_Sun"]["longitude"]
+            p_moon_lon = progressions["Progressed_Moon"]["longitude"]
+            prog_elongation = clamp360(p_moon_lon - p_sun_lon)
+            if prog_elongation < 45:
+                prog_phase = "New (Emergence)"
+            elif prog_elongation < 90:
+                prog_phase = "Crescent (Building)"
+            elif prog_elongation < 135:
+                prog_phase = "First Quarter (Action)"
+            elif prog_elongation < 180:
+                prog_phase = "Gibbous (Refining)"
+            elif prog_elongation < 225:
+                prog_phase = "Full (Culmination)"
+            elif prog_elongation < 270:
+                prog_phase = "Disseminating (Sharing)"
+            elif prog_elongation < 315:
+                prog_phase = "Last Quarter (Reorientation)"
+            else:
+                prog_phase = "Balsamic (Release)"
+            progressions["lunar_phase"] = {
+                "phase":       prog_phase,
+                "elongation":  round(prog_elongation, 2),
+            }
+
+        # Progressed-to-natal aspects (the primary timing engine for progressions)
+        # Orb of 1° is standard for progressed aspects.
+        PROG_ORB = 1.0
+        prog_natal_aspects = []
+
+        # Build the lookup tables
+        prog_lons = {
+            k.replace("Progressed_", ""): v["longitude"]
+            for k, v in progressions.items()
+            if k.startswith("Progressed_")
+        }
+        natal_lons: Dict[str, float] = {}
+        natal_lons.update({k: v["longitude"] for k, v in natal.get("placements", {}).items()
+                           if isinstance(v, dict) and "longitude" in v})
+        natal_lons.update({k: v["longitude"] for k, v in natal.get("angles", {}).items()
+                           if isinstance(v, dict) and "longitude" in v})
+
+        for prog_point, p_lon in prog_lons.items():
+            for natal_point, n_lon in natal_lons.items():
+                # Avoid planet aspecting its own natal position (too many trivial hits)
+                if prog_point == natal_point:
+                    continue
+                diff = abs(clamp360(p_lon) - clamp360(n_lon))
+                dist = min(diff, 360.0 - diff)
+                for angle, asp_name in [
+                    (0,   "Conjunction"), (60,  "Sextile"),
+                    (90,  "Square"),      (120, "Trine"),
+                    (180, "Opposition"),
+                ]:
+                    orb = abs(dist - angle)
+                    if orb <= PROG_ORB:
+                        prog_natal_aspects.append({
+                            "progressed":  prog_point,
+                            "natal":       natal_point,
+                            "aspect":      asp_name,
+                            "orb":         round(orb, 3),
+                        })
+
+        # Sort by exactness (tightest first)
+        prog_natal_aspects.sort(key=lambda x: x["orb"])
+        progressions["prog_natal_aspects"] = prog_natal_aspects
+
+        # Solar Arc
         solar_arc = 0
         if "Sun" in natal["placements"]:
             natal_sun = natal["placements"]["Sun"]["longitude"]
             prog_sun = progressions["Progressed_Sun"]["longitude"]
             solar_arc = clamp360(prog_sun - natal_sun)
 
-        # ── Solar Arc Directions ──────────────────────────────────────────────
+        # Solar Arc Directions — extend to all personal points + progressed angles
         directed = {}
         if solar_arc > 0:
-            for key in ["Sun", "Moon", "Mercury", "Venus", "Mars", "Ascendant"]:
-                if key in natal["placements"] or key in natal.get("angles", {}):
-                    base = natal["placements"].get(key, natal["angles"].get(key, {}))
-                    if base and "longitude" in base:
-                        dlon = clamp360(base["longitude"] + solar_arc)
-                        directed[key] = {
-                            "longitude": dlon,
-                            "sign": ZODIAC[int(clamp360(dlon) // 30)],
-                            "degree": clamp360(dlon) % 30
-                        }
+            # Apply SA to all natal planets and angles
+            all_natal_pts = {}
+            all_natal_pts.update(natal.get("placements", {}))
+            all_natal_pts.update(natal.get("angles", {}))
+            for key, base in all_natal_pts.items():
+                if isinstance(base, dict) and "longitude" in base:
+                    dlon = clamp360(base["longitude"] + solar_arc)
+                    directed[key] = {
+                        "longitude": dlon,
+                        "sign":      ZODIAC[int(clamp360(dlon) // 30)],
+                        "degree":    clamp360(dlon) % 30
+                    }
 
-        # ── Annual Profections (5-year) ───────────────────────────────────────
+        # Annual Profections (5-year)
+        # Use fractional age so profection year activates on birthday, not Jan 1.
         profections = []
         rulers = {
-            "Aries": "Mars", "Taurus": "Venus", "Gemini": "Mercury",
-            "Cancer": "Moon", "Leo": "Sun", "Virgo": "Mercury",
-            "Libra": "Venus", "Scorpio": "Mars", "Sagittarius": "Jupiter",
+            "Aries": "Mars",    "Taurus": "Venus",   "Gemini": "Mercury",
+            "Cancer": "Moon",   "Leo": "Sun",         "Virgo": "Mercury",
+            "Libra": "Venus",   "Scorpio": "Mars",    "Sagittarius": "Jupiter",
             "Capricorn": "Saturn", "Aquarius": "Saturn", "Pisces": "Jupiter"
         }
 
-        asc_sign_idx = 0
-        if time_known and "Ascendant" in natal.get("angles", {}):
-            asc_sign = natal["angles"]["Ascendant"]["sign"]
-            if asc_sign in ZODIAC:
-                asc_sign_idx = ZODIAC.index(asc_sign)
-
         for offset in range(5):
             year = now.year + offset
-            age = current_age + offset
-            prof_idx = (asc_sign_idx + age) % 12
+            # Age at the start of each target calendar year (birthday-precise)
+            age = int(elapsed_yrs) + offset
+
+            asc_sign_idx = 0
+            if time_known and "Ascendant" in natal.get("angles", {}):
+                asc_sign = natal["angles"]["Ascendant"]["sign"]
+                asc_sign_idx = ZODIAC.index(asc_sign)
+
+            prof_idx  = (asc_sign_idx + age) % 12
             prof_sign = ZODIAC[prof_idx]
+
             profections.append({
-                "year": year,
-                "age": age,
-                "profected_sign": prof_sign,
-                "time_lord": rulers[prof_sign],
-                "activated_house": (age % 12) + 1
+                "year":            year,
+                "age":             age,
+                "profected_sign":  prof_sign,
+                "time_lord":       rulers[prof_sign],
+                "activated_house": (age % 12) + 1,
             })
 
-        # ── Year-level transit snapshots (retained for Kakshya compatibility) ─
+        # ── OUTER PLANET TRANSIT ASPECT SCANNER (replaces Jan-1 snapshot) ──
+        # Scans day-by-day for exact hits with binary refinement.
+        # Produces outer_transit_aspects.by_year and .summary_block.
+        outer_transit_aspects = self._scan_outer_transit_aspects(natal, scan_years=5)
+
+        # Legacy snapshot transits (kept for backwards compat with any old callers)
         transits = []
         for offset in range(5):
             target_year = now.year + offset
-            target_dt = datetime(target_year, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
-            target_jd = ephe.julian_day(target_dt)
-
+            target_dt   = datetime(target_year, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+            target_jd   = ephe.julian_day(target_dt)
             yearly_transits = {}
             for name in ["Jupiter", "Saturn", "Uranus", "Neptune", "Pluto"]:
                 lon, _ = ephe.planet_longitude(target_jd, PLANETS[name])
                 yearly_transits[name] = {
                     "sign": ZODIAC[int(clamp360(lon) // 30)],
-                    "degree": round(clamp360(lon) % 30, 2),
-                    "longitude": round(lon, 4)
+                    "degree": clamp360(lon) % 30
                 }
             transits.append({"year": target_year, "positions": yearly_transits})
 
-        # ── Exact Outer Transit Aspect Hit Windows (daily scan, 5-year) ───────
-        # This produces entry/exact/exit dates for every major aspect
-        # between transiting outer planets and natal points.
-        # Falls back gracefully if the engine is not yet installed.
-        outer_transit_data = {}
-        try:
-            from core.outer_transit_aspects import build_outer_transits_for_archon
-
-            # Collect natal ecliptic longitudes (tropical)
-            natal_lons = {
-                name: data["longitude"]
-                for name, data in natal.get("placements", {}).items()
-                if "longitude" in data
-                   and name in ["Sun", "Moon", "Mercury", "Venus", "Mars",
-                                "Jupiter", "Saturn"]
-            }
-            angles = natal.get("angles", {})
-            if "Ascendant" in angles and "longitude" in angles["Ascendant"]:
-                natal_lons["Ascendant"] = angles["Ascendant"]["longitude"]
-            if "Midheaven" in angles and "longitude" in angles["Midheaven"]:
-                natal_lons["MC"] = angles["Midheaven"]["longitude"]
-
-            if natal_lons:
-                outer_transit_data = build_outer_transits_for_archon(jd, natal_lons, years_ahead=5)
-        except ImportError:
-            # Engine not yet installed — silent fallback, Archon uses year snapshots
-            outer_transit_data = {"hits": [], "summary_block": "", "note": "outer_transit_aspects not installed"}
-        except Exception as e:
-            outer_transit_data = {"error": str(e), "hits": [], "summary_block": ""}
-
         return {
-            "current_age": current_age,
-            "progressions": progressions,
-            "solar_arc_degrees": round(solar_arc, 2),
-            "directed_positions": directed,
-            "profections_timeline": profections,
-            "transits_timeline": transits,
-            "outer_transit_aspects": outer_transit_data  # exact entry/exact/exit dates
+            "current_age":           current_age,
+            "elapsed_years":         round(elapsed_yrs, 4),   # precise fractional age
+            "prog_jd":               round(prog_jd, 6),        # for external callers
+            "progressions":          progressions,
+            "solar_arc_degrees":     round(solar_arc, 2),
+            "directed_positions":    directed,
+            "profections_timeline":  profections,
+            "transits_timeline":     transits,          # legacy snapshots
+            "outer_transit_aspects": outer_transit_aspects,  # NEW: exact dates
         }
 
-    def calculate_lunar_returns(self, natal_jd: float, natal_moon_lon: float, years: int = 1) -> List[Dict]:
+    def calculate_lunar_returns(self, natal_jd: float, natal_moon_lon: float,
+                                 years: int = 1) -> List[Dict]:
         """Calculate lunar returns for monthly precision."""
         from core.lunar_return import LunarReturnEngine
         engine = LunarReturnEngine(natal_jd, natal_moon_lon)
@@ -411,13 +699,15 @@ class WesternEngine:
         engine = SyzygyEngine(natal_jd)
         return engine.calculate_syzygy()
 
-    def calculate_dignities(self, placements: Dict[str, Any], is_day: bool = True) -> Dict[str, Any]:
+    def calculate_dignities(self, placements: Dict[str, Any],
+                             is_day: bool = True) -> Dict[str, Any]:
         """Calculate essential dignities for all planets."""
         from core.essential_dignities import EssentialDignities
         dignity_engine = EssentialDignities()
 
-        positions = {p: (data['sign'], data['degree']) for p, data in placements.items() if
-                     'sign' in data and 'degree' in data}
+        positions = {p: (data['sign'], data['degree'])
+                     for p, data in placements.items()
+                     if 'sign' in data and 'degree' in data}
 
         dignities = {}
         for planet, (sign, deg) in positions.items():
@@ -425,15 +715,15 @@ class WesternEngine:
                 planet, sign, deg, is_day
             ).__dict__
 
-        # Find receptions
         receptions = dignity_engine.find_receptions(positions, is_day)
-        almuten = dignity_engine.calculate_almuten(positions, is_day)
+        almuten    = dignity_engine.calculate_almuten(positions, is_day)
 
         return {
             'planet_dignities': dignities,
-            'receptions': receptions,
-            'almuten': almuten
+            'receptions':       receptions,
+            'almuten':          almuten
         }
+
 
 # Export for other modules
 __all__ = ['WesternEngine', 'ZODIAC', 'clamp360']

@@ -26,8 +26,8 @@ class SajuExpert:
     3. THE CURRENT LUCK PILLAR (What is the decade's strategy?)
     4. TACTICAL ADVICE (Specific actions: colors, directions, industries, months to watch)"""
 
-    def analyze(self, chart_data: dict, mode: str = "natal") -> dict:
-        prompt = self._build_prompt(chart_data, mode)
+    def analyze(self, chart_data: dict, mode: str = "natal", user_questions: list = None) -> dict:
+        prompt = self._question_prefix(user_questions) + self._build_prompt(chart_data, mode)
 
         response = gateway.generate(
             system_prompt=self.SYSTEM_PROMPT,
@@ -43,6 +43,34 @@ class SajuExpert:
             "confidence": 0.88 if response.get("success") else 0.0,
             "model_used": settings.saju_expert_model
         }
+
+
+    @staticmethod
+    def _question_prefix(user_questions: list) -> str:
+        """Build a question-focus block to prepend to expert prompts."""
+        if not user_questions:
+            return ""
+        qs = [q.strip() for q in user_questions if q and q.strip()][:5]
+        if not qs:
+            return ""
+        lines = [
+            "╔══════════════════════════════════════════════════════════════╗",
+            "║  THESE QUESTIONS WERE SUBMITTED — BIAS YOUR ANALYSIS TOWARD ║",
+            "║  THE MECHANISMS MOST RELEVANT TO ANSWERING THEM.            ║",
+            "╚══════════════════════════════════════════════════════════════╝",
+        ]
+        for i, q in enumerate(qs, 1):
+            lines.append(f"  Q{i}: {q}")
+        lines += [
+            "",
+            "Prioritize the chart mechanisms, house lords, planets, and timing",
+            "windows most relevant to these questions. Do not answer them directly",
+            "— that is the Archon's job. But make sure the relevant evidence is",
+            "visible in your analysis so the synthesis layer can find it.",
+            "══════════════════════════════════════════════════════════════════",
+            "",
+        ]
+        return "\n".join(lines) + "\n\n"
 
     def _build_prompt(self, data: dict, mode: str) -> str:
         saju = data.get('bazi', {})

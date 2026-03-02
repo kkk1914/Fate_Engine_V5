@@ -26,6 +26,15 @@ class TemporalAligner:
     def __init__(self, natal_jd: float):
         self.natal_jd = natal_jd
         self._now_jd = self._datetime_to_jd(datetime.now(timezone.utc))
+        # Derive birth month/day for birthday-relative profection anchoring
+        try:
+            import swisseph as _swe
+            _y, _m, _d, _h = _swe.revjul(natal_jd)
+            self._birth_month = int(_m)
+            self._birth_day   = min(int(_d), 28)   # safe for all months
+        except Exception:
+            self._birth_month = 7
+            self._birth_day   = 1
 
     # ─────────────────────────────────────────────────────────────────────
     # Public API
@@ -53,6 +62,7 @@ class TemporalAligner:
             aligned += self._extract_solar_returns(w)
             aligned += self._extract_lunar_returns(w)
             aligned += self._extract_profections(w)
+            aligned += self._extract_outer_transits(w)   # NEW: exact planet transit hits
             aligned += self._extract_vimshottari(v)
             aligned += self._extract_tajaka(v)
             aligned += self._extract_da_yun(s)
@@ -205,13 +215,57 @@ class TemporalAligner:
             year = prof.get("year")
             if not year:
                 continue
+            # Anchor to birthday in that year, not June 15 midpoint
+            try:
+                bd_dt = datetime(int(year), self._birth_month, self._birth_day,
+                                 tzinfo=timezone.utc)
+                jd = self._datetime_to_jd(bd_dt)
+            except Exception:
+                jd = self._year_to_jd(int(year))
             events.append({
-                "jd": self._year_to_jd(int(year)),
-                "system": "Hellenistic",
-                "technique": "Profection",
-                "description": f"Profection {year}: {prof.get('profected_sign', '?')} (Time Lord: {prof.get('time_lord', '?')})",
-                "confidence": 0.70,
+                "jd":          jd,
+                "system":      "Hellenistic",
+                "technique":   "Profection",
+                "description": (f"Profection {year}: {prof.get('profected_sign', '?')} "
+                                f"(Time Lord: {prof.get('time_lord', '?')}, "
+                                f"House {prof.get('activated_house', '?')})"),
+                "confidence":  0.70,
+                "domain":      f"house_{prof.get('activated_house', '1')}",
             })
+        return events
+
+    def _extract_outer_transits(self, pred: Dict) -> List[Dict]:
+        """Extract exact outer planet transit hits — the most precise timing data."""
+        events = []
+        outer = pred.get("outer_transit_aspects", {})
+        hits = outer.get("hits") or outer.get("all_hits", [])
+        for h in hits:
+            try:
+                exact_jd = h.get("exact_jd")
+                if exact_jd:
+                    jd = float(exact_jd)
+                else:
+                    iso = h.get("exact_date_iso", "")
+                    if iso:
+                        y, mo, d = map(int, iso.split("-"))
+                        jd = self._datetime_to_jd(datetime(y, mo, d, tzinfo=timezone.utc))
+                    else:
+                        continue
+                if jd <= self._now_jd:
+                    continue
+                planet   = h.get("transiting") or h.get("planet", "?")
+                natal_pt = h.get("natal_point", "?")
+                aspect   = h.get("aspect", "?")
+                events.append({
+                    "jd":          jd,
+                    "system":      "Western",
+                    "technique":   "Transit_Aspect",
+                    "description": f"{planet} {aspect} natal {natal_pt}",
+                    "confidence":  0.62,
+                    "domain":      natal_pt.lower(),
+                })
+            except Exception:
+                continue
         return events
 
     def _extract_vimshottari(self, pred: Dict) -> List[Dict]:
@@ -338,8 +392,44 @@ class TemporalAligner:
         systems = list(set(e["system"] for e in events))
         techniques = list(set(e["technique"] for e in events))
         multi_system = len(systems) > 1
+        n_systems = len(systems)
+        n_events  = len(events)
         avg_confidence = (sum(e.get("confidence", 0.7) for e in events)
-                          / len(events))
+                          / n_events)
+
+        # ── Convergence score ──────────────────────────────────────────────
+        # A probability-like signal (0.0–1.0) expressing how much independent
+        # evidence points to this window.
+        #
+        # Formula:
+        #   base    = avg technique confidence (tracks historical reliability of each method)
+        #   multi   = bonus for crossing system boundaries (Western + Vedic ≠ one system echoing itself)
+        #   depth   = bonus for raw event count (more signals = more noise filtered)
+        #   cap     = 0.97 — we never claim certainty
+        #
+        # Interpretation bands the model is instructed to use:
+        #   ≥ 0.85  → "near-certain" (4+ systems, all agree)
+        #   0.70–0.84 → "high-confidence" (3 systems, or 2 strong ones)
+        #   0.55–0.69 → "moderate-confidence" (2 systems, typical orb)
+        #   < 0.55  → "low-confidence" (echo of a single system)
+
+        multi_bonus = 0.08 if n_systems >= 3 else (0.05 if n_systems == 2 else 0.0)
+        depth_bonus = min(0.08, (n_events - 2) * 0.02)  # +2% per event over 2, cap 8%
+        raw_score   = avg_confidence + multi_bonus + depth_bonus
+        convergence_score = round(min(0.97, raw_score), 3)
+
+        if convergence_score >= 0.85:
+            confidence_label = "NEAR-CERTAIN"
+            stoplight = "🔴"  # high-pressure — not danger, just significance
+        elif convergence_score >= 0.70:
+            confidence_label = "HIGH-CONFIDENCE"
+            stoplight = "🟠"
+        elif convergence_score >= 0.55:
+            confidence_label = "MODERATE-CONFIDENCE"
+            stoplight = "🟡"
+        else:
+            confidence_label = "LOW-CONFIDENCE"
+            stoplight = "🟢"
 
         return {
             "start_jd": events[0]["jd"],
@@ -347,9 +437,13 @@ class TemporalAligner:
             "events": events,
             "systems_involved": systems,
             "techniques_involved": techniques,
-            "intensity": len(events),
+            "intensity": n_events,
+            "n_systems": n_systems,
             "multi_system": multi_system,
             "avg_confidence": round(avg_confidence, 3),
+            "convergence_score": convergence_score,
+            "confidence_label": confidence_label,
+            "stoplight": stoplight,
             # Human-readable anchor
             "center_jd": (events[0]["jd"] + events[-1]["jd"]) / 2,
         }
